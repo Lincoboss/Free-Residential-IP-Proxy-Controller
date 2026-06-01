@@ -105,8 +105,8 @@ GET https://您的worker域名.workers.dev/api/proxies
 **客户端连接格式：**
 
 ```text
-socks5://proxy:888888@<VPS母机IP>:7920
-http://proxy:888888@<VPS母机IP>:7920
+socks5://代理用户名:代理密码@<VPS母机IP>:自定义端口
+http://代理用户名:代理密码@<VPS母机IP>:自定义端口
 
 ```
 
@@ -117,6 +117,29 @@ journalctl -u proxy-lite.service -f
 
 ```
 
+**VPS agent卸载命令：**
+
+```bash
+# 1. 停止并禁用守护进程
+systemctl stop proxy-lite.service 2>/dev/null
+systemctl disable proxy-lite.service 2>/dev/null
+rm -f /lib/systemd/system/proxy-lite.service
+systemctl daemon-reload
+
+# 2. 强杀残留的 Python 调度器和 OpenVPN 进程
+pkill -f "lite_manager.py" 2>/dev/null
+pkill -f "proxy_server.py" 2>/dev/null
+pkill -f "openvpn.*tun0" 2>/dev/null
+
+# 3. 清理策略路由 (防止断网)
+ip rule del table 100 2>/dev/null
+ip route flush table 100 2>/dev/null
+
+# 4. 删除所有代码和配置文件
+rm -rf /opt/proxy_lite
+
+echo "✅ 代理引擎及所有配置已彻底卸载清理完毕！"
+```
 ---
 
 ## ⚠️ 声明与限制
