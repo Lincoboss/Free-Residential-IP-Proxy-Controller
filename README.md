@@ -2,6 +2,8 @@
 
 ---
 
+本项目资源完全免费，如果有人问你收费，你肯定是上当受骗了！！！
+
 # 一键极速部署
 
 [![Deploy to Cloudflare Workers](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/a6216abcd/Free-Residential-IP-Proxy-Controller)
