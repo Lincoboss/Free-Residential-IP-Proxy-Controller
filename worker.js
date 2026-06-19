@@ -209,8 +209,16 @@ def proxy_client(client: socket.socket, address: tuple[str, int]) -> None:
 
 def start_proxy_server(host: str, port: int) -> None:
     try:
-        server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        # 支持双栈：判断地址中是否包含冒号以启用 AF_INET6
+        af = socket.AF_INET6 if ":" in host else socket.AF_INET
+        server = socket.socket(af, socket.SOCK_STREAM)
         server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        # 强制解除 V6ONLY，允许一个 IPv6 Socket 同时接收 IPv4 和 IPv6 连接
+        if af == socket.AF_INET6:
+            try:
+                server.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
+            except:
+                pass
         server.bind((host, port))
         server.listen(256)
     except Exception as e: return
@@ -266,6 +274,16 @@ class Tunnel:
 
 tun_main = Tunnel("tun_main", 101)
 tun_backup = Tunnel("tun_backup", 102)
+
+def penalize_node(ip: str, penalty: int):
+    """
+    节点信誉动态降级机制：
+    给不可用或低质的节点加上高额的虚拟 ping 值惩罚，
+    确保下一次调度排序时，该节点被永久压入蓄水池底部，从而避免"死循环假性枯竭"。
+    """
+    with reservoir_lock:
+        if ip in global_node_reservoir:
+            global_node_reservoir[ip]["ping"] += penalty
 
 def get_public_ip():
     global public_ip
@@ -387,8 +405,10 @@ def vpngate_fetch_loop():
         if snapshot:
             with reservoir_lock:
                 for n in snapshot:
-                    if n["ip"] not in dead_ips:
-                        global_node_reservoir[n["ip"]] = n
+                    # 保留原有的惩罚性 ping 值，防止坏节点被新抓取的快照刷新后又跑到前列去
+                    if n["ip"] in global_node_reservoir:
+                        n["ping"] = max(n["ping"], global_node_reservoir[n["ip"]]["ping"])
+                    global_node_reservoir[n["ip"]] = n
             print(f"[*] ⚡ 节点库更新，当前囤积有效节点 -> {len(global_node_reservoir)} 个", flush=True)
         time.sleep(300)
 
@@ -461,6 +481,7 @@ def connect_node(tun: Tunnel, node: dict):
             
             if not is_residential:
                 print(f"[-] {tun.name} 节点出口 ({egress_ip}) 检测为机房 IP，残忍抛弃！", flush=True)
+                penalize_node(node["ip"], 50000)  # 机房 IP 极重惩罚，几乎不再启用
                 dead_ips.add(node["ip"])
                 try: process.terminate(); process.wait(2)
                 except: process.kill()
@@ -470,6 +491,7 @@ def connect_node(tun: Tunnel, node: dict):
             res = subprocess.run(["curl", "-I", "-s", "-A", "Mozilla/5.0", "-m", "5", "--interface", tun.name, "https://www.youtube.com"], capture_output=True)
             if res.returncode != 0:
                 print(f"[-] {tun.name} 节点出口无法连通 YouTube，拉黑更换: {node['ip']}", flush=True)
+                penalize_node(node["ip"], 10000)  # YT 连不通重罚
                 dead_ips.add(node["ip"])
                 try: process.terminate(); process.wait(2)
                 except: process.kill()
@@ -486,6 +508,7 @@ def connect_node(tun: Tunnel, node: dict):
             role = "主网卡" if proxy_server.ACTIVE_BIND == tun.name else "备用网卡"
             print(f"[+] {tun.name} ({role}) 完全就绪: 入口 {node['ip']} -> 出口 {egress_ip}", flush=True)
         else:
+            penalize_node(node["ip"], 5000)  # 建连超时中度惩罚
             try: process.terminate(); process.wait(2)
             except: process.kill()
             dead_ips.add(node["ip"])
@@ -540,6 +563,7 @@ def health_check_loop():
             fail_count += 1
             if fail_count >= 3:
                 print(f"[!] {target_tun} 连续 {fail_count} 次多维探针(HTTP/ICMP)均无响应，确认为真死断流，执行踢线: {target_entry_ip}", flush=True)
+                penalize_node(target_entry_ip, 3000) # 运行中死掉的节点给予轻中度惩罚
                 dead_ips.add(target_entry_ip)
                 try: proc_ref.terminate(); proc_ref.wait(timeout=2)
                 except: proc_ref.kill()
@@ -566,7 +590,7 @@ def get_best_candidate():
             has_blacklisted = any(n["country"] == target_country for n in all_pool_nodes)
             if has_blacklisted:
                 dead_ips.clear()
-                print(f"[!] ⚡ 紧急熔断：[{target_country}] 节点枯竭，解锁历史黑名单救场！", flush=True)
+                print(f"[!] ⚡ 紧急熔断：[{target_country}] 节点黑名单释放救场（由于动态信誉系统存在，历史坏节点将被沉底）", flush=True)
                 candidates = [n for n in all_pool_nodes if n["country"] == target_country and n["ip"] not in active_ips]
 
         if candidates: return candidates.pop(0)
@@ -646,7 +670,8 @@ def main():
 
     threading.Thread(target=vpngate_fetch_loop, daemon=True).start()
     threading.Thread(target=update_config_loop, daemon=True).start()
-    threading.Thread(target=proxy_server.start_proxy_server, args=("0.0.0.0", PROXY_PORT), daemon=True).start()
+    # 启用全局 IPv6 ANY 监听
+    threading.Thread(target=proxy_server.start_proxy_server, args=("::", PROXY_PORT), daemon=True).start()
     threading.Thread(target=health_check_loop, daemon=True).start()
     threading.Thread(target=c2_heartbeat_loop, daemon=True).start()
     maintain_pool()
@@ -1120,7 +1145,7 @@ const DASHBOARD_HTML = (domain, webUser, webPass, proxyUser, proxyPass) => `
                 const terminal = document.getElementById('terminal-output');
                 
                 if (!servers || servers.length === 0) {
-                    tbody.innerHTML = '<tr><td colspan="4" class="py-12 text-center text-slate-500 flex-col items-center justify-center"><svg class="w-12 h-12 mx-auto text-slate-700 mb-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M19 11H5m14 0a2 2 0 012 2v6a2 2 0 01-2 2H5a2 2 0 01-2-2v-6a2 2 0 012-2m14 0V9a2 2 0 00-2-2M5 11V9a2 2 0 002-2m0 0V5a2 2 0 012-2h6a2 2 0 012 2v2M7 7h10"></path></svg>未检测到在线母机，请在 VPS 运行纳管命令接入</td></tr>';
+                    tbody.innerHTML = '<tr><td colspan="4" class="py-12 text-center text-slate-500 flex-col items-center justify-center"><svg class="w-12 h-12 mx-auto text-slate-700 mb-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M19 11H5m14 0a2 2 0 012 2v6a2 2 0 01-2 2H5a2 2 0 01-2-2v-6a2 2 0 012-2m14 0V9a2 2 0 00-2-2M5 11V9a2 2 0 012-2h6a2 2 0 012 2v2M7 7h10"></path></svg>未检测到在线母机，请在 VPS 运行纳管命令接入</td></tr>';
                     return;
                 }
 
